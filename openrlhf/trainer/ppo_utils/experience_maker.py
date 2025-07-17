@@ -28,6 +28,17 @@ def pin_memory(tensor: Union[torch.Tensor, list[torch.Tensor]]):
         return [pin_memory(t) for t in tensor]
     return tensor.pin_memory() if isinstance(tensor, torch.Tensor) else tensor
 
+def save_strings_to_txt(queries_list: list, file_path: str) -> None:
+    """
+
+    """
+    with open(file_path, 'w', encoding='utf-8') as f:
+        for line in queries_list:
+            f.write(line.replace("\n", " ") + '\n')
+            f.write("********************************************************************************* \n")
+
+    print(f"sucessfully saved to {file_path} with {len(queries_list)} lines")
+
 
 @dataclass
 class Experience:
@@ -405,6 +416,7 @@ class SamplesGenerator:
             # Get rewards info from remote model
             rewards_info = ray.get(remote_reward_model.get_rewards.remote(all_queries, all_prompts, all_labels))
             # Process rewards and scores
+            print(rewards_info)
             update_samples_with_rewards(rewards_info, samples_list)
 
         return samples_list
@@ -475,7 +487,7 @@ class RemoteExperienceMaker(ABC):
         return samples_list
 
     @torch.no_grad()
-    def make_experience_batch(self, rollout_samples) -> List[Experience]:
+    def make_experience_batch(self, rollout_samples, steps) -> List[Experience]:
         """
         Make a list of experience with the micro_rollout_batch_size.
 
@@ -487,14 +499,14 @@ class RemoteExperienceMaker(ABC):
         samples_list = self.split_rollout_samples(rollout_samples)
 
         # Make experiences (models forward: logprobs, values, rewards, and kl divergence)
-        experiences = self.make_experience(samples_list)
+        experiences = self.make_experience(samples_list, steps)
 
         # Process experiences (reward shaping, etc.)
         experiences = self.compute_advantages_and_returns(experiences)
         return experiences
 
     @torch.no_grad()
-    def make_experience(self, samples_list: List[Experience]) -> List[Experience]:
+    def make_experience(self, samples_list: List[Experience], steps=0) -> List[Experience]:
         """
         Turn samples into experience by calculating logprobs, values, rewards, and kl divergence.
         """
@@ -514,6 +526,11 @@ class RemoteExperienceMaker(ABC):
         if samples_list[0].rewards is not None:
             pass
         elif self.remote_rm_url:
+            action_mask_pad = []
+            for action_mask in action_mask_list:
+                zeros_col = torch.zeros((action_mask.size(0), 1), dtype=action_mask.dtype)
+                restored_mask_cat = torch.cat([zeros_col, action_mask], dim=1)
+                action_mask_pad.append(restored_mask_cat)
             queries_list = sum(
                 [
                     self.tokenizer.batch_decode(remove_pad_token(seq, attention_mask), skip_special_tokens=False)
@@ -521,6 +538,16 @@ class RemoteExperienceMaker(ABC):
                 ],
                 [],
             )
+            if (steps - 1) % 100 == 0:
+                save_strings_to_txt(queries_list, f"prompt_answer{str(steps)}.txt")
+            queries_list = []
+            for seq, mask in zip(sequences_list, action_mask_pad):
+                masked_seq = [seq[i][mask[i].bool()] for i in range(seq.shape[0])]
+                decoded_texts = self.tokenizer.batch_decode(masked_seq, skip_special_tokens=False)
+                queries_list.extend(decoded_texts)
+            if (steps - 1) % 100 == 0:
+                save_strings_to_txt(queries_list, f"root/answer{str(steps)}.txt")
+
             prompts_list = sum([s.prompts for s in samples_list], [])
             labels_list = sum([s.labels for s in samples_list], [])
             # Keep the remote call asynchronous
